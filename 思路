@@ -1,1 +1,1018 @@
+# 小说创作引擎 —— 完整系统设计文档
 
+> 本文档是给 AI（DeepSeek）阅读的实现参考文档，包含完整的系统架构、数据模型、模块设计和实施路线。
+> 请 AI 团队基于此文档理解项目全貌后，协助实现各模块。
+
+---
+
+## 零、项目背景
+
+### 0.1 用户现有资产
+
+用户（作者）在 `D:\AI` 目录下有多个项目：
+
+| 项目 | 说明 |
+|------|------|
+| `llm-rag-lab` | 公共知识库抽取原型（ChromaDB + LLM 实体抽取 + RapidGraph 关系图） |
+| `langchain` | LangChain 学习项目（Chat/Prompt/Chain/Agent/Graph/RAG评测） |
+| `vela-master` | AI 驱动的小说创作 IDE（Electron + React + TypeScript 桌面应用） |
+| `NovelForge-main` | 另一个小说创作工具（Python 后端 + Web 前端） |
+
+### 0.2 当前知识图谱现状
+
+`llm-rag-lab/works/demo-novel/entities.json` 中已有三个 fork 实体示例：
+
+- 哪吒（fork 自封神演义）
+- 姜子牙（fork 自封神演义）
+- 孙悟空（fork 自西游记）
+
+实体结构参考 `llm-rag-lab/docs/canon-schema.md`，包含字段：
+`id, name, aliases, tradition, entity_type, gender, description, personality, position, abilities, affiliation, relationships, sources, tags`
+
+在 Work 实体上扩展了：`work_id, source (fork/original), canon_id, overrides, story_state`
+
+### 0.3 抽取流水线现状
+
+```
+用户上传文本 → 按6000字切块（重叠1200字）→ Qwen 7B（本地Ollama）逐块抽取 → 
+合并去重 → 冲突交给 DeepSeek 裁决
+```
+
+- 本地显卡：AMD 7845HX + RTX 4060 8G，无法并发
+- DeepSeek 通过 ccswitch 代理调用
+- 已知问题：知识库质量粗糙，缺乏深度
+
+---
+
+## 一、系统核心理念
+
+### 1.1 产品定位
+
+本系统不是"AI 代笔工具"，而是**模拟世界的创作引擎**。作者扮演造物主/命运之手，通过投放命运卡牌干预角色自发的演化过程，在知识图谱约束下涌现故事。
+
+### 1.2 三力博弈模型
+
+叙事由三种力量共同驱动：
+
+| 力量 | 来源 | 作用方式 |
+|------|------|---------|
+| **命运之力** | 作者投放命运卡牌 | 外部注入，打破平衡，改变角色属性 |
+| **角色之力** | 性格驱动自主推演 | 基于当前属性（性格/处境/关系）自主决定行为 |
+| **环境之力** | 知识图谱约束 | 世界观设定不可违背，其他角色自主反应 |
+
+三力同时作用于每一章的生成过程。
+
+### 1.3 三层架构
+
+```
+┌──────────────────────────────────────────────┐
+│  Layer 3: 创作引擎                            │
+│  CrewAI 团队层：推演师 / 写手 / 审校            │
+│  每章调用 Layer 1 + Layer 2，消费三力          │
+└───────────────────┬──────────────────────────┘
+                    │  查询 & 更新
+┌───────────────────┴──────────────────────────┐
+│  Layer 2: 项目知识库（每本小说独立）              │
+│  fork 的实体 + 原创实体 + 人物弧光 + 章节状态     │
+│  伏笔追踪 + 命运卡牌效果记录                    │
+└───────────────────┬──────────────────────────┘
+                    │ fork（带溯源链）
+┌───────────────────┴──────────────────────────┐
+│  Layer 1: 公共知识库（只增不改）                 │
+│  神话 / 典籍 / 历史的实体-关系图谱              │
+│  逆向大纲模板库（高分小说的结构性抽取）            │
+│  ChromaDB（语义检索）+ JSON/NetworkX（图存储）   │
+└──────────────────────────────────────────────┘
+```
+
+### 1.4 三层卡片体系
+
+| 层级 | 卡片类型 | 来源 | 作者如何使用 |
+|------|---------|------|------------|
+| 第一层 | **知识卡片（KG 卡片）** | 从典籍中抽取 | 浏览、挑选、fork 到项目 |
+| 第二层 | **命运卡片（Fate 卡片）** | 从高分小说抽取转折事件 | 写作中投放，改变角色走向 |
+| 第三层 | **模板卡片（大纲卡片）** | 从高分小说抽取结构骨架 | 选定模板，用 KG 卡片填充 |
+
+三层卡片通过索引互相联动。作者浏览哪吒卡片时可以看到关联的李靖卡片、阐教教义卡片、父子冲突命运卡片等。
+
+---
+
+## 二、Layer 1：公共知识库
+
+### 2.1 知识库质量标准
+
+商业化知识库与 Demo 知识库的核心差距：**不只要回答"是什么"，还要回答"为什么"和"如果...会怎样"**。
+
+一个实体应该是**可推理的行为模型**，而非标签列表。
+
+#### 2.1.1 人物实体 —— 完整示例
+
+```json
+{
+  "id": "fengshen:nezha",
+  "name": "哪吒",
+  "entity_type": "character",
+  "tradition": "fengshen",
+  "aliases": ["三太子", "哪吒三太子"],
+  "gender": "男",
+  "description": "灵珠子转世，陈塘关李靖第三子",
+
+  "identity": {
+    "true_nature": "灵珠子转世，天生带有杀伐之气",
+    "mortal_identity": "陈塘关总兵李靖第三子",
+    "divine_identity": "阐教三代弟子，伐纣先锋",
+    "self_perception": "既觉得自己不凡，又渴望父亲认可",
+    "core_wound": "被父亲恐惧和厌弃 —— 这是所有行为的根源"
+  },
+
+  "personality_model": {
+    "surface_traits": ["叛逆", "刚烈", "少年意气"],
+    "deep_drives": {
+      "primary": "证明自己（向父亲、向天下）",
+      "secondary": "保护认可自己的人（母亲、师父、兄弟）",
+      "hidden": "渴望无条件的被接纳"
+    },
+    "behavioral_patterns": {
+      "when_threatened": "正面硬刚，绝不服软",
+      "when_innocent_accused": "以极端方式证明清白（参考剔骨还父）",
+      "when_someone_he_cares_for_is_hurt": "不计后果地报复",
+      "attitude_to_authority": "不认天命，只认情义"
+    },
+    "contradictions": [
+      "嘴上说不在乎父亲看法，但剔骨还父的本质是绝望的证明",
+      "对外人狠辣，对认可的人忠诚到死",
+      "冲动鲁莽，但大事上从不含糊"
+    ]
+  },
+
+  "ability_system": {
+    "source": "莲花化身（太乙真人重塑）",
+    "combat_style": "近战爆发型，乾坤圈速攻 + 火尖枪压制 + 三头八臂全方位打击",
+    "abilities": [
+      {
+        "name": "乾坤圈",
+        "type": "法宝-攻击",
+        "effect": "高速投掷，可锁定追踪，专打头部",
+        "limitation": "对元神强大者可被收走，曾被太上老君的金刚琢克制",
+        "cost": "无（法器自动回收）"
+      },
+      {
+        "name": "莲花化身",
+        "type": "被动-体质",
+        "effect": "非血肉之躯，不惧普通伤害，不受魂魄攻击",
+        "limitation": "对特殊法宝仍有弱点，且无法通过普通修炼提升修为",
+        "cost": "永久性 —— 丧失了正常人的血肉之躯，某种意义上不再是'人'"
+      }
+    ],
+    "power_level": {
+      "ranking": "阐教三代弟子中顶尖，但不如杨戬综合实力",
+      "strong_against": ["物理攻击", "灵魂攻击", "群体战斗（三头八臂）"],
+      "weak_against": ["顶级法宝克制", "阵法的困锁"]
+    }
+  },
+
+  "relationship_network": [
+    {
+      "target": "fengshen:lijing",
+      "type": "父子",
+      "dynamic": "爱恨交织",
+      "history": [
+        {"event": "出生时肉球异象", "impact": "李靖畏惧，认为是不祥之物"},
+        {"event": "闹海杀敖丙", "impact": "李靖恐惧惹祸，态度更冷"},
+        {"event": "剔骨还父", "impact": "哪吒以此断绝父子关系，李靖震怒砸毁金身"},
+        {"event": "莲花化身后", "impact": "哪吒追着李靖打，太乙真人调解后勉强共存"}
+      ],
+      "current_state": "表面和解，实则隔阂。李靖心虚，哪吒不屑。但危机时会联手。",
+      "what_would_change_this": "李靖真正为他挺身而出一次，或者哪吒真正原谅他一次"
+    }
+  ],
+
+  "narrative_hooks": [
+    {
+      "hook": "剔骨还父的伤疤",
+      "question": "他真的放下了吗？如果有一个和父亲和解的机会，他会怎么做？",
+      "suitable_for": ["亲情线", "成长线", "回忆杀"]
+    },
+    {
+      "hook": "不是人的孤独",
+      "question": "莲花化身让他失去血肉之躯，他和凡人之间有无法跨越的距离。",
+      "suitable_for": ["感情线", "身份认同危机"]
+    },
+    {
+      "hook": "为兄弟赴死",
+      "question": "对认可的人忠诚到死 —— 如果有一天要在师父和兄弟之间选一个？",
+      "suitable_for": ["两难抉择", "高潮情节"]
+    }
+  ],
+
+  "sources": [
+    {"text": "封神演义第十二回", "claim": "哪吒闹海杀敖丙"},
+    {"text": "封神演义第十三回", "claim": "哪吒剔骨还父"},
+    {"text": "封神演义第十四回", "claim": "太乙真人莲花化身"}
+  ],
+
+  "tags": ["少年", "战神", "莲花", "叛逆", "父子矛盾"]
+}
+```
+
+**关键设计要点**：
+- `personality_model` 不是标签列表，而是驱动力 + 行为模式 + 内在矛盾
+- `ability_system` 不是名称列表，而是效果 + 限制 + 代价 + 克制关系
+- `relationship_network` 不是类型标签，而是历史 + 动态 + 临界点（什么能改变这个关系）
+- `narrative_hooks` 是从知识中提炼的可直接使用的故事线
+
+#### 2.1.2 思想体系实体 —— 完整示例
+
+```json
+{
+  "id": "daoist:cultivation_system",
+  "name": "道教修炼体系",
+  "entity_type": "thought_system",
+  "tradition": "daoist",
+
+  "worldview": {
+    "cosmology": "道生一，一生二，二生三，三生万物。万物皆有道性，修道即回归本源。",
+    "core_principle": "逆天而行——修炼是通过自身努力对抗自然衰亡的过程",
+    "what_is_power": "对'道'的理解深度 + 身体和灵魂的锤炼程度",
+    "source_of_power": "天地灵气（外取） + 自身精气神（内炼）"
+  },
+
+  "cultivation_ladder": [
+    {
+      "stage": "炼气期",
+      "description": "感知天地灵气，引气入体",
+      "lifespan": "120岁",
+      "typical_abilities": "内力外放，轻功初成",
+      "how_to_breakthrough": "打通全身经脉，气贯周身",
+      "failure_consequence": "经脉阻塞，无法寸进",
+      "narrative_function": "废柴期 / 新手村"
+    },
+    {
+      "stage": "筑基期",
+      "description": "易筋洗髓，重塑肉身基础",
+      "lifespan": "300岁",
+      "typical_abilities": "御剑飞行，基础法术",
+      "how_to_breakthrough": "筑成道基，需要筑基丹或大量灵气",
+      "failure_consequence": "道基不稳，后期必崩",
+      "narrative_function": "宗门比试 / 小副本"
+    },
+    {
+      "stage": "金丹期",
+      "description": "精炁神凝聚为金丹",
+      "lifespan": "800岁",
+      "typical_abilities": "金丹神通，神识外放，踏空而行",
+      "how_to_breakthrough": "金丹九转，每一转需机缘",
+      "failure_consequence": "丹碎人亡（风险极高）",
+      "narrative_function": "中流砥柱 / 一地大佬"
+    },
+    {
+      "stage": "元婴期",
+      "description": "打破金丹，化出元婴",
+      "lifespan": "3000岁",
+      "typical_abilities": "元婴出窍，肉身被毁仍可重生",
+      "breakthrough_requirement": "领悟天地法则之一",
+      "narrative_function": "一方霸主 / 大门派掌门"
+    },
+    {
+      "stage": "化神期",
+      "description": "元婴成长为元神，融入天地",
+      "lifespan": "万年",
+      "typical_abilities": "一念千里，干涉天地规则",
+      "narrative_function": "大能 / 幕后布局者"
+    }
+  ],
+
+  "world_laws": [
+    {
+      "law": "修为代差不可越",
+      "rule": "金丹期不可能正面打赢元婴期，除非有逆天法宝或对方重伤",
+      "exception": "主角光环 —— 但需要有合理解释（血脉觉醒、阵法辅助等）",
+      "why_this_matters": "防止战力崩坏。如果随便是个人都能越级杀敌，修炼体系就废了。"
+    },
+    {
+      "law": "突破需要机缘",
+      "rule": "突破大境界不能靠苦修，必须有机缘（顿悟、奇遇、丹药、战斗）",
+      "why_this_matters": "给命运卡牌系统提供了理论基础 —— 作者的卡牌就是这个'机缘'"
+    },
+    {
+      "law": "天劫是公平的",
+      "rule": "越是逆天的突破，天劫越强。因果缠身者天劫加倍。",
+      "why_this_matters": "高潮场景的来源 —— 渡劫本身就是一场大戏"
+    },
+    {
+      "law": "神不能直接干涉凡人界",
+      "rule": "修为越高，越受天道约束。化神以上不能轻易对低境界者出手。",
+      "why_this_matters": "解释了为什么大能们不直接碾死主角 —— 不是不想，是不能"
+    }
+  ],
+
+  "school_interpretations": {
+    "正统道家": {
+      "view": "修炼即是回归自然，顺应天道",
+      "method": "清修 + 炼丹 + 参悟",
+      "attitude_to_evil": "魔道必须铲除"
+    },
+    "魔道": {
+      "view": "天道不公，逆天而行才是真正的自由",
+      "method": "吞噬他人修为 + 血祭 + 极端功法",
+      "attitude_to_good": "假仁假义，强者为尊"
+    },
+    "散修": {
+      "view": "不在乎正邪，只想活下去、变强",
+      "method": "有什么用什么，不留退路",
+      "attitude_to_everyone": "不信任任何人"
+    }
+  },
+
+  "narrative_conflicts": [
+    "正邪之争：正统道家和魔道的对立是永恒的战场",
+    "理念之争：顺应天道 vs 逆天而行，谁是真正的'道'？",
+    "阶级固化：大门派垄断资源，散修如何出头？",
+    "天道不仁：如果天道本身就是压迫弱者的，修炼者该服从还是反抗？"
+  ],
+
+  "tags": ["修炼体系", "仙侠", "道教", "力量体系", "世界规则"]
+}
+```
+
+**关键设计要点**：
+- `world_laws` 是"世界的物理法则"——定义了什么能做、什么不能做
+- `cultivation_ladder` 提供了完整的战力阶梯和叙事功能
+- `school_interpretations` 展示了同一套规则下不同流派的解读差异
+- 思想体系的本质是**小说的运行规则**，不是知识条目的堆砌
+
+#### 2.1.3 地点/场景实体 —— 完整示例
+
+```json
+{
+  "id": "world:huaguoshan",
+  "name": "花果山",
+  "entity_type": "location",
+  "tradition": "journey_west",
+
+  "basic_info": {
+    "location": "东胜神洲傲来国海外",
+    "type": "海岛仙山",
+    "size": "方圆数百里",
+    "climate": "四季如春，灵气充沛",
+    "unique_feature": "山巅有一块仙石，受天真地秀、日精月华，孕育出石猴（孙悟空）"
+  },
+
+  "geography": {
+    "surface": "山林茂密，果树遍布，瀑布飞流",
+    "notable_spots": [
+      {
+        "name": "水帘洞",
+        "type": "洞府",
+        "description": "瀑布后的天然石洞，内有石碑'花果山福地，水帘洞洞天'",
+        "narrative_use": "猴群的家园，孙悟空称王的起点",
+        "secrets": "天然形成的洞天福地，本身就是一个修炼宝地"
+      },
+      {
+        "name": "仙石所在",
+        "type": "圣地",
+        "description": "山巅最高处，仙石所在的位置",
+        "narrative_use": "可设为后人朝圣之地 / 孙悟空力量的源头"
+      }
+    ],
+    "surroundings": "四面环海，离傲来国不远，与东海龙宫毗邻"
+  },
+
+  "politics": {
+    "ruler": "孙悟空（美猴王）→ 空缺（悟空出海学艺时）→ 孙悟空（归来后）",
+    "government_type": "以实力为尊的部落式王国",
+    "factions": [
+      {"name": "猴族", "status": "统治族群"},
+      {"name": "七十二洞妖王", "status": "臣服于孙悟空，但他走后可能不老实"}
+    ],
+    "alliances": ["曾与牛魔王等六位妖王结拜"],
+    "enemies": ["天庭（官方敌对）", "东海龙王（私人恩怨）"]
+  },
+
+  "resources": {
+    "spiritual": "灵气充沛，适合修炼（但并不算顶尖，不如仙山洞府）",
+    "material": ["各种灵果", "瀑布水源", "石材"],
+    "strategic_value": "作为东海上的据点，是通往东胜神洲的门户",
+    "what_makes_it_special": "不是资源多好，而是'孙悟空的家乡'这个身份"
+  },
+
+  "history": [
+    {"time": "远古", "event": "仙石开始吸收天地灵气"},
+    {"time": "石猴诞生", "event": "石破天惊，孙悟空降世，三界震动"},
+    {"time": "称王", "event": "闯水帘洞，被尊为美猴王"},
+    {"time": "悟空出海", "event": "猴群群龙无首，被混世魔王欺负"},
+    {"time": "悟空归来", "event": "斩杀混世魔王，收服七十二洞妖王"},
+    {"time": "大闹天宫后", "event": "天庭围剿花果山，猴群遭到屠杀"},
+    {"time": "被压五行山后", "event": "花果山元气大伤，妖王叛逃，沦为普通妖山"}
+  ],
+
+  "story_potential": [
+    {
+      "premise": "孙悟空被压五行山期间，谁在守护花果山？",
+      "genre": "守护 / 冒险",
+      "core_conflict": "七十二洞妖王蠢蠢欲动，天庭可能派人接管"
+    },
+    {
+      "premise": "千年后的花果山 —— 猴族后裔寻找祖辈的荣光",
+      "genre": "后传 / 新生代",
+      "core_conflict": "仙石遗址被开发？水帘洞的秘密仍未解开？"
+    }
+  ],
+
+  "connections": [
+    {"to": "world:aolai_guo", "relation": "毗邻的人类国家"},
+    {"to": "world:east_dragon_palace", "relation": "海底邻居，因闹海关系紧张"},
+    {"to": "world:lingtai_fangcun_shan", "relation": "孙悟空学艺之地"},
+    {"to": "world:heaven", "relation": "被天庭视为'妖孽聚集地'"}
+  ],
+
+  "tags": ["海岛", "仙山", "妖王领地", "起点场景", "孙悟空"]
+}
+```
+
+**关键设计要点**：
+- `history` 是时间线，不是静态描述——地点也在随时间变化
+- `story_potential` 预置了可用的故事线
+- `connections` 建立了地理网络
+- `politics` 字段表明一个地点也是权力结构
+
+### 2.2 公共库目录规范
+
+```
+canon/
+  fengshen/entities.json
+  journey_west/entities.json
+  sanguo/entities.json
+  greek/entities.json
+  daoist/thought_systems.json
+  template_library/
+    reverse_outlines/
+      xianxia/
+        template_001.json    # 废柴逆袭型
+        template_002.json    # 重生复仇型
+      xuanhuan/
+        template_003.json    # 学院流
+```
+
+### 2.3 领域标签体系
+
+单个知识库，用三层标签区分（不物理拆分）：
+
+```
+一级领域：mythology / history / philosophy / literature / folklore
+二级领域：chinese / greek / norse / japanese ...
+概念标签：权力、父权、雷霆、命运、因果 ...
+哲学层面：命运不可违、神权的代价 ...
+```
+
+### 2.4 搜索策略（大规模时）
+
+```
+混合搜索：
+  ChromaDB（语义搜索） → 找到语义相关实体
+  SQLite（结构化查询） → 按tradition/entity_type过滤
+  NetworkX（图遍历）   → 从匹配实体出发，拉取关联实体
+```
+
+---
+
+## 三、Layer 2：项目知识库
+
+### 3.1 目录结构
+
+```
+projects/{project_id}/
+  meta.json              # 项目元信息（书名、描述、创建时间）
+  entities.json          # 本书实体（fork + 原创）
+  chapters/
+    ch_001.json          # 每章内容 + 状态快照
+    ch_002.json
+  character_arcs.json    # 人物弧光设计
+  fate_log.json          # 命运卡牌投放记录
+  hooks.json             # 伏笔追踪
+  state_snapshot.json    # 当前全局状态快照
+```
+
+### 3.2 实体 Schema（扩展自公共库）
+
+在公共库实体基础上增加：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `work_id` | string | 所属项目 |
+| `source` | "canon" / "fork" / "original" | 来源 |
+| `canon_id` | string \| null | fork 时指向公共库 id |
+| `overrides` | object | 仅记录相对 canon 的覆盖字段 |
+| `story_state` | object | 剧情态（位置、情绪、目标、实力、更新章节） |
+
+### 3.3 Fork API
+
+```python
+class ProjectKG:
+    def fork_entity(self, canon_id: str, project_id: str) -> Entity
+    def fork_entities_by_tradition(self, tradition: str, project_id: str)
+    def override_entity(self, entity_id: str, field: str, value)
+    def get_entity(self, entity_id: str) -> Entity  # 自动合并 overrides
+    def add_original_entity(self, project_id: str, data: dict) -> Entity
+    def walk_relations(self, entity_id: str, depth: int = 2) -> Graph
+```
+
+---
+
+## 四、人物弧光系统
+
+### 4.1 核心概念
+
+人物弧光 = 角色在整个故事中性格、身份、能力、关系的演变轨迹。
+
+### 4.2 弧光模板库
+
+```python
+ARC_TEMPLATES = {
+    "rise": {  # 崛起型（废柴逆袭）
+        "stages": [
+            {"name": "废物",   "identity": "被轻视的", "drive": "生存"},
+            {"name": "觉醒",   "identity": "获得力量",  "drive": "变强"},
+            {"name": "成长",   "identity": "崭露头角",  "drive": "证明"},
+            {"name": "巅峰",   "identity": "强者",      "drive": "守护/征服"},
+        ]
+    },
+    "redemption": {  # 救赎型
+        "stages": [
+            {"name": "堕落者", "identity": "有罪的/失败的", "drive": "逃避/麻木"},
+            {"name": "催化剂", "identity": "被触动",        "drive": "动摇"},
+            {"name": "挣扎",   "identity": "尝试改变",      "drive": "证明自己"},
+            {"name": "赎罪",   "identity": "牺牲/奉献",     "drive": "弥补过错"},
+            {"name": "新生",   "identity": "被接纳",        "drive": "守护"},
+        ]
+    },
+    "fall": {  # 堕落型
+        "stages": [
+            {"name": "理想者", "identity": "正直的",   "drive": "正义"},
+            {"name": "考验",   "identity": "被背叛/失去", "drive": "复仇/生存"},
+            {"name": "黑化",   "identity": "不择手段",  "drive": "力量"},
+            {"name": "毁灭",   "identity": "众叛亲离",  "drive": "毁灭一切"},
+        ]
+    },
+    "flat": {  # 稳定型（配角）
+        "stages": [
+            {"name": "稳定",   "identity": "不变的",   "drive": "忠于自我/守护某物"},
+        ]
+    },
+}
+```
+
+### 4.3 弧光实例化（存储到 character_arcs.json）
+
+```json
+{
+  "character_id": "project_a:ye_fan",
+  "arc_template": "rise",
+  "stage_mapping": [
+    {"stage": "废物",  "chapter_range": [1, 20]},
+    {"stage": "觉醒",  "chapter_range": [21, 50]},
+    {"stage": "成长",  "chapter_range": [51, 150]},
+    {"stage": "巅峰",  "chapter_range": [151, 200]}
+  ],
+  "personality_trajectory": {
+    "ch_1":   {"懦弱": 0.7, "善良": 0.6, "自卑": 0.8},
+    "ch_20":  {"懦弱": 0.5, "善良": 0.6, "自卑": 0.5, "愤怒": 0.3},
+    "ch_50":  {"懦弱": 0.2, "果断": 0.6, "坚韧": 0.7}
+  }
+}
+```
+
+### 4.4 弧光驱动的生成逻辑
+
+```
+每章生成：
+  1. 基于角色当前性格 + 处境 → 推演角色会做什么（角色之力）
+  2. 检测弧光阶段：角色是否该进入下一阶段了？
+  3. 如果有命运卡牌投放 → 叠加卡牌效果
+  4. 生成章节
+  5. 更新角色状态：性格微妙变化、关系变化、处境改变
+```
+
+---
+
+## 五、命运卡牌系统
+
+### 5.1 卡牌五类
+
+| 类别 | 作用 | 投放时机 | 示例 |
+|------|------|---------|------|
+| `disaster` | 制造低谷，产生驱动力 | 上升期末尾 | 被宗门逐出、退婚、修为被废 |
+| `awakening` | 给予突破，看到希望 | 低谷最深时 | 戒指灵魂苏醒、悬崖秘洞、血脉觉醒 |
+| `conflict` | 制造障碍，增加张力 | 力量增长后 | 好友背叛、宗门追杀、触碰禁忌 |
+| `growth` | 量变到质变 | 长期铺垫后 | 生死战中突破、领悟新技能 |
+| `revolution` | 颠覆一切，改变世界观 | 故事中后盘 | 发现世界真相、天命之人、获得系统 |
+
+### 5.2 卡牌数据结构
+
+```json
+{
+  "card_id": "fate_disaster_001",
+  "name": "被宗门逐出",
+  "rarity": "普通",
+  "category": "disaster",
+  "trigger_conditions": {
+    "min_chapter": 3,
+    "pacing_requirement": "emotional_down",
+    "character_requirements": {
+      "power_level_max": "筑基",
+      "personality_contains": ["自卑", "懦弱"],
+      "identity_contains": ["弟子"]
+    }
+  },
+  "effects": {
+    "personality_changes": {"愤怒": 0.3, "倔强": 0.2, "自卑": -0.1},
+    "identity_change": "弃徒",
+    "situation_change": "流落荒野，身无分文",
+    "relation_changes": [
+      {"target": "宗门", "old": "归属", "new": "仇恨"},
+      {"target": "师父", "old": "尊敬", "new": "复杂"}
+    ],
+    "drive_change": "从'安逸修炼'变为'洗清冤屈，重回宗门'"
+  },
+  "hook": {
+    "text": "宗门为何突然驱逐你？背后是谁在推动？",
+    "intended_resolution_chapter": [40, 60],
+    "related_entities": ["宗门长老", "神秘幕后黑手"]
+  }
+}
+```
+
+### 5.3 叙事节奏监控
+
+```python
+def check_narrative_pacing(chapters):
+    """分析最近N章情绪曲线，判断是否需要作者干预"""
+    emotional_scores = [analyze_emotion(ch) for ch in chapters[-20:]]
+
+    alerts = []
+    if len(set(emotional_scores[-10:])) <= 2:
+        alerts.append("⚠️ 连续10章情绪无波动，建议投放 conflict/awakening 卡牌")
+    if all(s > 0 for s in emotional_scores[-15:]):
+        alerts.append("⚠️ 连续15章无挫折，建议投放 disaster 卡牌")
+    if all(s < -0.3 for s in emotional_scores[-8:]):
+        alerts.append("⚠️ 连续8章处于低谷，建议投放 awakening 卡牌")
+    return alerts
+```
+
+### 5.4 命运卡牌的另一来源：从高分小说中抽取
+
+```python
+def extract_fate_cards_from_novel(novel_text, chapter_num):
+    """
+    让 LLM 逐章分析，识别"外力改变角色内在属性"的事件。
+    如果不是命运转折事件，返回 {"is_fate_event": false}。
+    """
+    prompt = f"""
+    阅读第{chapter_num}章，判断是否发生了"命运转折事件"。
+    命运转折事件：某个外部事件显著改变了角色的性格/能力/关系/目标。
+
+    如果是，提取为JSON：
+    {{
+      "event_name": "...",
+      "category": "disaster|awakening|conflict|growth|revolution",
+      "character_before": {{}},
+      "character_after": {{}},
+      "pre_conditions": {{}}
+    }}
+    """
+```
+
+### 5.5 卡牌投放流程
+
+```
+1. 检查前置条件（最低章节、角色状态要求、叙事节奏要求）
+2. 应用效果到角色状态（性格变化、关系变化、处境改变、驱动变化）
+3. 更新关系边
+4. 注册伏笔（自动从 card.hook 生成）
+5. 记录 fate_log
+```
+
+---
+
+## 六、伏笔追踪系统
+
+### 6.1 数据模型
+
+```json
+{
+  "hook_id": "hook_ch003_001",
+  "type": "mystery",
+  "status": "unresolved",
+  "created_at_chapter": 3,
+  "description": "药老的仇人到底是谁？",
+  "source": "fate_card:fate_awakening_001",
+  "related_characters": ["ye_fan", "yao_lao"],
+  "suggested_resolution": {"chapter_min": 50, "chapter_max": 80},
+  "remind_author_at_chapter": 45,
+  "resolved_at_chapter": null
+}
+```
+
+### 6.2 两种来源
+1. 作者投放命运卡牌时自动注册
+2. 作者手动标记
+
+### 6.3 提醒机制
+
+每一章开始前检查：
+- 如果接近建议回收区间 → info 提醒
+- 如果已超过建议回收区间 → warning 提醒
+
+---
+
+## 七、逆向大纲系统
+
+### 7.1 抽取层级
+
+```
+书 → 卷（情绪大方向）→ 阶段（成长主线）→ 章（事件+情绪+人物变化）
+```
+
+### 7.2 模板数据结构
+
+```json
+{
+  "template_id": "tpl_xianxia_rise_001",
+  "name": "废柴逆袭 + 退婚流",
+  "genre": "仙侠",
+  "volumes": [{
+    "name": "废柴少年的崛起之路",
+    "emotional_arc": "下行 → 谷底 → 转折 → 持续上升",
+    "phases": [{
+      "name": "跌落谷底",
+      "events": [{
+        "event_type": "冲突-退婚/贬低",
+        "emotional_direction": "down",
+        "function": "打破初始状态，制造驱动力",
+        "slots_to_fill": [
+          {"slot": "被退婚者", "type": "主角"},
+          {"slot": "退婚者", "type": "势力/家族"},
+          {"slot": "见证者", "type": "群众"}
+        ]
+      }]
+    }]
+  }]
+}
+```
+
+### 7.3 使用方式
+
+```
+模板骨架（逆向大纲） + 项目 KG 实体 = 全新故事
+骨架复用，血肉替换。
+```
+
+---
+
+## 八、卡片化展示层
+
+### 8.1 三层卡片体系
+
+| 层级 | 卡片类型 | 来源 | 用途 |
+|------|---------|------|------|
+| 第一层 | **知识卡片（KG 卡片）** | 典籍抽取 | 作者浏览、挑选、fork |
+| 第二层 | **命运卡片（Fate 卡片）** | 高分小说抽取 | 写作中投放 |
+| 第三层 | **模板卡片（大纲卡片）** | 高分小说抽取结构 | 选定模板，KG 填充 |
+
+### 8.2 卡片间的联动索引
+
+每张卡片包含 `related_cards`，索引到其他卡片：
+
+```json
+{
+  "card_id": "kg_card:nezha",
+  "card_type": "character",
+  "title": "哪吒",
+  "summary": "封神演义 · 三代弟子 · 莲花化身",
+  "related_cards": {
+    "characters": [
+      {"card_id": "kg_card:lijing", "relation": "父亲——爱恨交织"},
+      {"card_id": "kg_card:yangjian", "relation": "同门——实力相当"}
+    ],
+    "locations": [{"card_id": "kg_card:chentangguan", "relation": "故乡"}],
+    "thought_systems": [{"card_id": "kg_card:daoist_cultivation", "relation": "修炼体系"}],
+    "fate_cards": [{"card_id": "fate_card:father_conflict", "relation": "父子矛盾叙事"}],
+    "template_cards": [{"card_id": "tpl:rebellion_hero", "relation": "适合叛逆英雄模板"}]
+  }
+}
+```
+
+### 8.3 CardGenerator
+
+在抽取流水线产出的 `entities.json` 之上加一层展示层：
+
+```python
+class CardGenerator:
+    def generate_character_card(self, entity) -> Card
+    def generate_thought_card(self, system) -> Card
+    def generate_location_card(self, location) -> Card
+```
+
+---
+
+## 九、创作引擎（CrewAI 集成）
+
+### 9.1 Agent 团队
+
+| Agent | 职责 | 工具 |
+|-------|------|------|
+| `plot_evolver`（推演师） | 基于角色状态推演行为 | query_project_kg, check_arc_stage |
+| `chapter_writer`（写手） | 将推演结果写成章节 | query_world_setting, get_entity |
+| `quality_checker`（审校） | 质量把控 | check_consistency, check_pacing |
+
+### 9.2 单章生成流程
+
+```
+前置检查（伏笔提醒 + 节奏监控 + 作者是否投放卡牌）
+  ↓
+Task 1: 角色决策（推演师）
+  - 输入：上一章剧情 + 角色状态 + 弧光阶段 + 命运卡牌（如有）
+  - 输出：每个角色在这一章的行为决策
+  ↓
+Task 2: 写章节（写手）
+  - 输入：角色决策 + 世界观设定（从KG查询）+ 环境事件
+  - 输出：完整的章节文本
+  ↓
+Task 3: 审校（审校）
+  - 检查：人物OOC、情节逻辑、世界观一致性
+  ↓
+后置处理
+  - 更新角色状态（性格微调、关系变化、处境更新）
+  - 保存章节
+  - 注册新伏笔
+  - 更新弧光进度
+```
+
+### 9.3 CrewAI 与 LangGraph 的关系
+
+用户目前使用 CrewAI（已搭建 AI 写作团队）。
+CrewAI 适合当前需求（顺序执行、简单直接、快速出活）。
+LangGraph 作为深入学习目标，适合需要更精细流程控制时迁移。
+二者不冲突：CrewAI 跑起来出成果，LangGraph 学底层做深度。
+
+---
+
+## 十、抽取流水线优化
+
+### 10.1 当前流水线
+
+```
+用户上传文本 → 6000字切块（1200重叠）→ Qwen 7B 逐块抽取 → 合并去重 → DeepSeek 裁决冲突
+```
+
+### 10.2 优化方案
+
+#### 语义分块
+按段落边界切，保持实体上下文完整。相邻 chunk 重叠 20%。
+
+#### 三阶段抽取
+```
+阶段1: Qwen 7B 初步抽取（宽松 prompt，列出所有人物/组织/法宝）
+阶段2: Qwen 7B 自校验（严格 prompt，逐项核对，修正错误，补充遗漏）
+阶段3: DeepSeek 结构化抽取（仅对确认实体，逐个抽取详情）
+```
+
+#### 嵌入去重
+```
+第1级：SentenceTransformers 嵌入相似度聚类（threshold=0.85）
+第2级：模糊情况 → Qwen 裁决（免费，本地）
+第3级：仍不确定 → DeepSeek 批量裁决（付费，远程，一次请求打包多个冲突）
+```
+
+#### Few-shot 示例注入
+将已人工确认的实体（哪吒、孙悟空、姜子牙）作为示例写入 Qwen 的 prompt。
+
+### 10.3 自动爬取维基/百科
+
+```
+目标典籍 → LLM 提取重要人物列表（+ 重要性打分）→ 
+对重要性 >= 3 的人物 → 维基百科 API 爬取文本 → 
+LLM 抽取实体 → 存入公共 KG → 交叉验证
+```
+
+优先使用 `wikipediaapi` Python 库，稳定且合规。
+
+### 10.4 成本优化效果
+
+| 方案 | Qwen调用 | DeepSeek调用 | 总耗时 |
+|------|---------|-------------|--------|
+| 当前 | 逐块抽 | ~30次 | ~10分钟 |
+| 优化后 | 并行 | ~5次（仅处理无法裁决的） | ~3分钟 |
+
+---
+
+## 十一、完整文件结构
+
+```
+novel-engine/
+├── canon/                              # Layer 1: 公共知识库
+│   ├── fengshen/entities.json
+│   ├── journey_west/entities.json
+│   ├── sanguo/entities.json
+│   ├── greek/entities.json
+│   ├── daoist/thought_systems.json
+│   └── template_library/
+│       └── reverse_outlines/
+│           ├── xianxia/
+│           └── xuanhuan/
+│
+├── projects/                           # Layer 2: 项目知识库
+│   └── {project_id}/
+│       ├── meta.json
+│       ├── entities.json
+│       ├── character_arcs.json
+│       ├── fate_log.json
+│       ├── hooks.json
+│       ├── state_snapshot.json
+│       └── chapters/
+│           ├── ch_001.json
+│           └── ...
+│
+├── engine/                             # Layer 3: 创作引擎
+│   ├── kg/
+│   │   ├── public_kg.py               # 公共库操作
+│   │   ├── project_kg.py              # 项目库操作
+│   │   └── fork.py                    # Fork 机制
+│   ├── character/
+│   │   ├── arc_templates.py           # 弧光模板库
+│   │   └── state_manager.py           # 角色状态管理
+│   ├── fate/
+│   │   ├── card_library.py            # 命运卡牌库
+│   │   └── pacing_monitor.py          # 叙事节奏监控
+│   ├── hooks/
+│   │   └── tracker.py                 # 伏笔追踪
+│   ├── templates/
+│   │   └── reverse_outline.py         # 逆向大纲应用
+│   ├── cards/
+│   │   └── card_generator.py          # 卡片化展示层
+│   ├── extract/
+│   │   ├── semantic_chunk.py          # 语义分块
+│   │   ├── extract_qwen.py            # Qwen 初步抽取
+│   │   ├── extract_deepseek.py        # DeepSeek 深度抽取
+│   │   ├── deduplicate.py             # 实体去重
+│   │   └── wiki_crawler.py            # 维基百科爬取
+│   └── crew/
+│       ├── agents.py                  # CrewAI Agent 定义
+│       ├── tasks.py                   # Task 模板
+│       └── chapter_pipeline.py        # 单章生成流水线
+│
+└── docs/
+    └── architecture-for-ai.md          # 本文档
+```
+
+---
+
+## 十二、实施路线图
+
+| 阶段 | 任务 | 优先级 | 预计周期 |
+|------|------|--------|---------|
+| **P0 夯实基础** | 公共KG扩展（封神演义、希腊神话） + Fork API完善 + 语义分块 | 🔴 高 | 1-2周 |
+| **P0 夯实基础** | Few-shot 示例注入 Qwen prompt + 嵌入去重 | 🔴 高 | 3-5天 |
+| **P1 核心能力** | 人物弧光系统（模板 + 状态追踪） | 🔴 高 | 1-2周 |
+| **P1 核心能力** | 命运卡牌系统（卡片定义 + 投放逻辑 + 叙事节奏监控） | 🔴 高 | 1-2周 |
+| **P1 核心能力** | 知识库质量升级（从标签列表升级到行为模型，按2.1标准） | 🟡 中 | 2-3周 |
+| **P1 核心能力** | CrewAI 接入 KG（创作引擎能查询项目 KG） | 🟡 中 | 1周 |
+| **P1 核心能力** | 三阶段抽取流水线 + 三级冲突处理 | 🟡 中 | 1-2周 |
+| **P2 智能化** | 逆向大纲系统（抽取高分小说模板） | 🟢 低 | 2-4周 |
+| **P2 智能化** | 伏笔追踪系统 | 🟢 低 | 1周 |
+| **P2 智能化** | 卡片化展示层（CardGenerator） | 🟢 低 | 1周 |
+| **P2 智能化** | 维基百科自动爬取流水线 | 🟢 低 | 1-2周 |
+| **P3 产品化** | Vela IDE 集成（可视化卡片浏览器、命运卡牌投放面板） | 远期 | 持续 |
+
+---
+
+## 十三、关键设计决策记录
+
+1. **知识库 = 单库 + 三层标签**，不物理拆分。理由：跨体系查询（如"孙悟空闯入希腊万神殿"）是核心场景。
+2. **人物实体 = 行为模型，不是标签列表**。必须包含：驱动力、行为模式、关系动态、叙事钩子。
+3. **思想体系 = 世界运行规则**。必须定义什么能做、什么不能做、例外是什么。
+4. **地点 = 舞台 + 时间线**。地点也在演化，不是静态的。
+5. **框架选型 = CrewAI 优先级高于 LangGraph**。CrewAI 更适合当前的顺序任务场景。LangGraph 在需要循环/中断/子图时再迁移。
+6. **卡片化 = 知识库的用户界面**。JSON 给开发者，卡片给创作者。
+7. **三力模型 = 命运 + 角色 + 环境**。每一章的生成都是三种力量的博弈结果。
+8. **命运卡牌 = 作者的上帝之手**。解决纯角色驱动系统"主角永远出不了新手村"的根本缺陷。
+
+---
+
+## 附录：给 AI 团队的实现建议
+
+1. **先理解三力模型**：这是整个系统的灵魂。所有模块都围绕"命运之力（作者投放卡牌）+ 角色之力（自主推演）+ 环境之力（KG约束）"设计。
+
+2. **先升级知识库质量**：在写任何创作引擎代码之前，先把公共 KG 的抽取标准提升到 2.1 节的质量。好的知识库能有效减少后期 prompt engineering 的工作量。
+
+3. **分阶段实现**：P0 基础 → P1 核心 → P2 智能化。不要同时开工所有模块。
+
+4. **保持 JSON 作为数据交换格式**：简单、可读、跨语言。不需要 Neo4j 等重型数据库。
+
+5. **测试驱动**：用 demo-novel 的三个人物（哪吒、孙悟空、姜子牙）作为最小可验证单元。跑通"抽取 → fork → 弧光 → 命运卡牌 → 生成一章"的完整流程。
+
+6. **注意用户的环境**：
+   - 本地显卡 8G，Qwen 一次只能跑一个 chunk
+   - DeepSeek 通过 ccswitch 代理，注意 token 消耗
+   - 操作系统 Windows，Shell 为 PowerShell
+   - 已有 Python venv 在 `llm-rag-lab/.venv/`
